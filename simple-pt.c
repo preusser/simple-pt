@@ -61,6 +61,7 @@
 #include <trace/events/sched.h>
 #include <asm/msr.h>
 #include <asm/processor.h>
+#include <asm/processor-flags.h>
 #define CREATE_TRACE_POINTS
 #include "pttp.h"
 
@@ -410,26 +411,28 @@ static void init_mask_ptrs(void)
 }
 
 // https://carteryagemann.com/pid-to-cr3.html
-static u64 pid_to_cr3(int pid) {
-	struct task_struct *task;
-	struct mm_struct *mm;
-	void *cr3_virt;
-	unsigned long cr3_phys;
+static u64 pid_to_cr3(int const pid) {
+	unsigned long cr3_phys = 0;
+	rcu_read_lock();
+	{
+		struct task_struct	const *const task = pid_task(find_vpid(pid), PIDTYPE_PID);
+		struct mm_struct	const *mm;
 
-	task = pid_task(find_vpid(pid), PIDTYPE_PID);
-	if(task == NULL)	return 0; // pid has no task_struct
-	mm = task->mm;
+		if(task == NULL)	goto out; // pid has no task_struct
+		mm = task->mm;
 
-	// mm can be NULL in some rare cases (e.g. kthreads)
-	// when this happens, we should check active_mm
-	if(mm == NULL) {
-		mm = task->active_mm;
-		if(mm == NULL)	return 0; // this shouldn't happen, but just in case
+		// mm can be NULL in some rare cases (e.g. kthreads)
+		// when this happens, we should check active_mm
+		if(mm == NULL) {
+			mm = task->active_mm;
+			if(mm == NULL)	goto out; // this shouldn't happen, but just in case
+		}
+
+		cr3_phys = virt_to_phys((void*)mm->pgd);
 	}
-
-	cr3_virt = (void*)mm->pgd;
-	cr3_phys = virt_to_phys(cr3_virt);
-	return	cr3_phys + 0x1800; // ?: This offset is strange but consistently seen in the PIP messages.
+	out:
+	rcu_read_unlock();
+	return	cr3_phys;
 }
 
 static inline void set_cr3_filter0(u64 cr3) {
@@ -472,7 +475,18 @@ static int start_pt(void)
 		val |= CTL_USER;
 	if (cr3_filter && has_cr3_match) {
 		if(cr3_filter > 1) {
-			set_cr3_filter0(pid_to_cr3(cr3_filter) & ~0xFFF);
+			u64 cr3 = pid_to_cr3(cr3_filter) & ~CR3_PCID_MASK;
+#ifdef CONFIG_PAGE_TABLE_ISOLATION
+			if(IS_ENABLED(CONFIG_PAGE_TABLE_ISOLATION) && static_cpu_has(X86_FEATURE_PTI)) {
+				if(user) {
+					cr3 |= 1 << PAGE_SHIFT;
+					if(kernel) {
+						pr_warn("Cannot trace kernel along with user space using CR3 filter in PTI-enabled kernel.\n");
+					}
+				}
+			}
+#endif
+			set_cr3_filter0(cr3);
 			comm_filter[0] = '\0';	// Do not re-target on exec()
 		}
 		else if(!(oldval & CR3_FILTER)) {
